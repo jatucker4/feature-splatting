@@ -14,6 +14,8 @@ import torch.nn.functional as F
 from PIL import Image
 import matplotlib.pyplot as plt
 import maskclip_onnx
+from unimatch.evaluate_flow import inference_flow_filenames
+from unimatch.unimatch.unimatch import UniMatch
 
 def pytorch_gc():
     torch.cuda.empty_cache()
@@ -63,6 +65,50 @@ def batch_iterator(batch_size: int, *args) -> Generator[List[Any], None, None]:
     n_batches = len(args[0]) // batch_size + int(len(args[0]) % batch_size != 0)
     for b in range(n_batches):
         yield [arg[b * batch_size : (b + 1) * batch_size] for arg in args]
+
+def build_flow_model():
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # model
+    model = UniMatch(feature_channels=128,
+                     num_scales=2,
+                     upsample_factor=4,
+                     num_head=1,
+                     ffn_dim_expansion=4,
+                     num_transformer_layers=6,
+                     reg_refine=True,
+                     task='flow').to(device)
+    # resume checkpoints
+
+    loc = 'cuda:{}'.format(0) if torch.cuda.is_available() else 'cpu'
+    checkpoint = torch.load("/home/jatucker/cvpr2025/feature-splatting/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth", map_location=loc)
+
+    model.load_state_dict(checkpoint['model'], strict=True)
+
+    return model
+
+def run_flow_inference(model_without_ddp, images):
+    flow_preds = inference_flow_filenames(model_without_ddp,
+                       images=images,
+                       inference_video=None,
+                       output_path='output/gmflow-scale2-regrefine6-davis',
+                       padding_factor=32,
+                       inference_size=None,
+                       save_flo_flow=False,
+                       attn_type='swin',
+                       attn_splits_list=[2, 8],
+                       corr_radius_list=[-1, 4],
+                       prop_radius_list=[-1, 1],
+                       pred_bidir_flow=False,
+                       pred_bwd_flow=False,
+                       num_reg_refine=6,
+                       fwd_bwd_consistency_check=False,
+                       save_video=False,
+                       concat_flow_img=False,
+                       )
+    flow_preds = [np.zeros_like(flow_preds[0])] + flow_preds
+    return np.stack( flow_preds, axis=0 )
 
 
 class MaskCLIPFeaturizer(nn.Module):
@@ -240,7 +286,7 @@ def batch_extract_feature(image_paths: List[str], args):
         aggregated_feat_map = F.interpolate(aggregated_feat_map[None], (final_H, final_W), mode='bilinear', align_corners=False)[0]
 
         ret_dict['samclip'].append(aggregated_feat_map.detach().cpu())
-
+        
         gc.collect()
     
     del clip_model

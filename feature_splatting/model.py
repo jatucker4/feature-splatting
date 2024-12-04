@@ -18,7 +18,7 @@ from nerfstudio.viewer.server.viewer_elements import (
     ViewerVec3,
 )
 from nerfstudio.data.scene_box import OrientedBox
-
+from feature_splatting.dynamics_model import VelocityTransformer
 # Feature splatting functions
 from torch.nn import Parameter
 from feature_splatting.utils import (
@@ -32,6 +32,7 @@ from feature_splatting.utils import (
     get_ground_bbox_min_max,
     gaussian_editor
 )
+from feature_splatting.utils.math_utils import velocity_to_optical_flow
 try:
     from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
     from gsplat.rendering import rasterization
@@ -76,7 +77,13 @@ class FeatureSplattingModel(SplatfactoModel):
         
         # Initialize per-Gaussian features
         distill_features = torch.nn.Parameter(torch.zeros((self.means.shape[0], self.config.feat_latent_dim)))
-        self.gauss_params["distill_features"] = distill_features
+        velocities = torch.nn.Parameter(torch.zeros((self.means.shape)))
+        gauss_time = torch.nn.Parameter(torch.zeros(self.means.shape[0], 1))
+
+        self.gauss_params["distill_features"] = distill_features 
+        # self.gauss_params["velocities"] = velocities  # Edited code
+        # self.gauss_params["times"] = gauss_time #  Edited code
+
         self.main_feature_name = self.kwargs["metadata"]["main_feature_name"]
         self.main_feature_shape_chw = self.kwargs["metadata"]["feature_dim_dict"][self.main_feature_name]
 
@@ -85,6 +92,7 @@ class FeatureSplattingModel(SplatfactoModel):
                                          self.config.mlp_hidden_dim,
                                          self.kwargs["metadata"]["feature_dim_dict"])
         
+        self.dynamics_network = VelocityTransformer(input_dim=self.config.feat_latent_dim+3+1,d_model=256, nhead=8, num_encoder_layers=6)
         # Visualization utils
         self.maybe_populate_text_encoder()
         self.setup_gui()
@@ -229,6 +237,21 @@ class FeatureSplattingModel(SplatfactoModel):
 
         return selected_obj_idx, sample_idx
 
+    def get_dynamics_output(self,distill_features_crop, means_crop, camera):
+        # Call the transformer model to update velocities and delta time
+        # Use the current position, SAM2 embeddings, and time as inputs
+        # new_velocities, new_delta_t = self.dynamics_network(
+        new_velocities = self.dynamics_network(
+            feature_embeddings=distill_features_crop,
+            positions=means_crop,
+            timesteps=camera.time
+        )
+
+        # Apply velocities to update the positions of Gaussians
+        # means_crop = means_crop + new_velocities * camera.delta_t.unsqueeze(-1)
+        means_crop.data = means_crop.data + new_velocities * camera.delta_t
+        return means_crop, new_velocities
+
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs.
 
@@ -267,6 +290,7 @@ class FeatureSplattingModel(SplatfactoModel):
             scales_crop = self.scales[crop_ids]
             quats_crop = self.quats[crop_ids]
             distill_features_crop = self.distill_features[crop_ids]
+            # times_crop = self.times[crop_ids]
         else:
             opacities_crop = self.opacities
             means_crop = self.means
@@ -275,7 +299,10 @@ class FeatureSplattingModel(SplatfactoModel):
             scales_crop = self.scales
             quats_crop = self.quats
             distill_features_crop = self.distill_features
+            # times_crop = self.times
 
+
+        means_crop.data, new_velocities = self.get_dynamics_output(distill_features_crop, means_crop, camera)
         # features_dc_crop.shape: [N, 3]
         # features_rest_crop.shape: [N, 15, 3]
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
@@ -310,7 +337,7 @@ class FeatureSplattingModel(SplatfactoModel):
             fused_render_properties = torch.cat((colors_crop, distill_features_crop), dim=1)
             sh_degree_to_use = None
 
-        render, alpha, info = rasterization(
+        render, alpha, self.info = rasterization(
             means=means_crop,
             quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
             scales=torch.exp(scales_crop),
@@ -332,11 +359,10 @@ class FeatureSplattingModel(SplatfactoModel):
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
-
-        if self.training and info["means2d"].requires_grad:
-            info["means2d"].retain_grad()
-        self.xys = info["means2d"]  # [1, N, 2]
-        self.radii = info["radii"][0]  # [N]
+        if self.training and self.info["means2d"].requires_grad:
+            self.info["means2d"].retain_grad()
+        self.xys = self.info["means2d"]  # [1, N, 2]
+        self.radii = self.info["radii"][0]  # [N]
         alpha = alpha[:, ...]
 
         background = self._get_background_color()
@@ -355,13 +381,14 @@ class FeatureSplattingModel(SplatfactoModel):
             background = background.expand(H, W, 3)
         
         feature = render[:, ..., 3:3 + self.config.feat_latent_dim]
-
+        flow_output = velocity_to_optical_flow(new_velocities, self.xys[0], W=W, H=H)
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore,
             "feature": feature.squeeze(0),  # type: ignore
+            "flow": flow_output
         }  # type: ignore
 
     def decode_features(self, features_hwc: torch.Tensor, resize_factor: float = 1.) -> Dict[str, torch.Tensor]:
@@ -385,11 +412,17 @@ class FeatureSplattingModel(SplatfactoModel):
         decoded_feature_dict = self.decode_features(outputs["feature"])
         feature_loss = torch.tensor(0.0, device=self.device)
         for key, target_feat in batch['feature_dict'].items():
-            cur_loss_weight = 1.0 if key == self.main_feature_name else self.config.feat_aux_loss_weight
-            ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
-            target_feat[:, ignore_feat_mask] = decoded_feature_dict[key][:, ignore_feat_mask]
-            feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight
+            if key is not "flow_features":
+                cur_loss_weight = 1.0 if key == self.main_feature_name else self.config.feat_aux_loss_weight
+                ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
+                target_feat[:, ignore_feat_mask] = decoded_feature_dict[key][:, ignore_feat_mask]
+                feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight
         loss_dict["feature_loss"] = self.config.feat_loss_weight * feature_loss
+        flow_features = batch['feature_dict']["flow_features"]
+        gt_flow = self._downscale_if_required(flow_features)
+        flow_mse_loss = nn.MSELoss()
+        loss_dict["flow_loss"] = flow_mse_loss(outputs["flow"],gt_flow)
+        # Need to add the loss for the 
         return loss_dict
     
     @torch.no_grad()
@@ -445,7 +478,14 @@ class FeatureSplattingModel(SplatfactoModel):
         return outs
     
     # ===== Utils functions for managing the gaussians =====
-
+    # @property
+    # def velocities(self):
+    #     return self.gauss_params["velocities"]
+    
+    # @property
+    # def times(self):
+    #     return self.gauss_params["times"]
+    
     @property
     def distill_features(self):
         return self.gauss_params["distill_features"]
@@ -492,6 +532,11 @@ class FeatureSplattingModel(SplatfactoModel):
         new_quats = self.quats[split_mask].repeat(samps, 1)
         # step 6 (RQ, July 2024), sample new distill_features
         new_distill_features = self.distill_features[split_mask].repeat(samps, 1)
+        # step 7 sample new times
+        # new_times = self.times[split_mask].repeat(samps, 1)
+        # step 7 sample new times
+        new_velocity = self.velocities[split_mask].repeat(samps, 1)
+
         out = {
             "means": new_means,
             "features_dc": new_features_dc,
@@ -500,6 +545,8 @@ class FeatureSplattingModel(SplatfactoModel):
             "scales": new_scales,
             "quats": new_quats,
             "distill_features": new_distill_features,
+            # "times": new_times,
+            "velocity": new_velocity,
         }
         for name, param in self.gauss_params.items():
             if name not in out:
@@ -519,6 +566,7 @@ class FeatureSplattingModel(SplatfactoModel):
         # The distill_features parameter is added via the get_gaussian_param_groups method
         param_groups = super().get_param_groups()
         param_groups["feature_mlp"] = list(self.feature_mlp.parameters())
+        param_groups["dynamics_network"] = list(self.dynamics_network.parameters())
         return param_groups
     
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:

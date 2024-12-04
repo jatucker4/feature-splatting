@@ -60,6 +60,10 @@ feature_splatting_method = MethodSpecification(
                     max_steps=10000,
                 ),
             },
+            "dynamics_network": {
+                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+                "scheduler": None,
+            },
             "feature_mlp": {
                 "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
                 "scheduler": None,
